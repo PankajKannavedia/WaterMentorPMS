@@ -763,6 +763,24 @@
     </div>
 
     <script>
+      /**
+       * Every server call goes through here so a spinner can never hang: a server
+       * exception or a null result is passed to the same handler as { error: "..." },
+       * which every render function already knows how to show.
+       */
+      function runSafe(onSuccess) {
+        return google.script.run
+          .withSuccessHandler(function (res) {
+            if (res === null || res === undefined) res = { error: "No data returned from the server." };
+            try { onSuccess(res); } catch (e) { console.error("Render failed", e); }
+          })
+          .withFailureHandler(function (err) {
+            const msg = (err && err.message) ? err.message : String(err);
+            console.error("Server call failed:", msg);
+            try { onSuccess({ error: msg }); } catch (e) { console.error("Render failed", e); }
+          });
+      }
+
       document.addEventListener("DOMContentLoaded", initialLoad);
 
       /**
@@ -828,7 +846,7 @@
 
             // Standard behavior: populate dropdown based on selected bucket
             if (typeof currentBucket !== 'undefined' && currentBucket) {
-                google.script.run.withSuccessHandler(populateProjectDropdown).getProjectNamesByBucket(currentBucket);
+                runSafe(populateProjectDropdown).getProjectNamesByBucket(currentBucket);
             } else {
                 document.getElementById('project-name').innerHTML = '<option>No bucket selected.</option>';
             }
@@ -970,6 +988,11 @@
       function populateProjectDropdown(projectNames) {
         const select = document.getElementById("project-name");
         select.innerHTML = "";
+        if (projectNames && projectNames.error) {
+          select.innerHTML = "<option>Could not load projects</option>";
+          alert("Could not load projects: " + projectNames.error);
+          return;
+        }
         if (!projectNames || projectNames.length === 0) {
           select.innerHTML = "<option>No projects found</option>";
           return;
@@ -984,6 +1007,9 @@
         updateDashboard(document.getElementById("project-name").value);
       }
 
+      let dashToken = 0;   // bumps on every project change so stale responses are ignored
+      let dashKpis = {};   // KPI values merged from the sections that have arrived
+
       function updateDashboard(projectName) {
         // 1. Show loading spinners for CHARTS
         document.getElementById('chart_div').innerHTML = '<div class="flex flex-col items-center justify-center h-64"><div class="spinner mb-2"></div><p class="text-sm text-gray-500">Loading Timeline...</p></div>';
@@ -993,36 +1019,87 @@
         // 2. Show loading spinners for KPI CARDS (New)
         setKpiLoadingState();
 
-        // 3. Make ONE single call to the server
-        google.script.run
-          .withSuccessHandler(function(data) {
-            
-            if (!data || data.error) {
-               console.error("Data load error", data ? data.error : "Unknown");
-               alert("Failed to load project data.");
-               return;
-            }
+        // 3. Sections that read different spreadsheets run at once. The four that all read the
+        //    project's bucket spreadsheet run one after another (smallest first), so that
+        //    spreadsheet is never hit with several heavy requests at the same time; a section
+        //    that takes longer than SECTION_TIMEOUT_MS no longer holds up the next one.
+        const token = ++dashToken;
+        dashKpis = {};
+        momData = { headers: [], rows: [] };
+        const SECTION_TIMEOUT_MS = 90000;
 
-            // A. Store MOM Data Globally (THIS IS NEW)
-            momData = data.momData || { headers: [], rows: [] };
-
-            // B. Update Hero Section
-            updateProjectDetails(data.details);
-
-            // C. Update KPI Cards
-            updateKpiDashboard(data.kpis);
-
-            // C. Draw Charts
-            if (data.details && data.details.isoNo) {
-                drawD3Chart(data.timelineChart);
-                drawMilestoneComboChart(data.milestoneChart);
+        const fetchSection = function (section, onData, onFail, next) {
+          let finished = false, timer = null;
+          const finish = function () {
+            if (finished) return;
+            finished = true;
+            if (timer) clearTimeout(timer);
+            if (next) next();
+          };
+          if (next) {
+            timer = setTimeout(function () {
+              console.error("Section '" + section + "' is taking over " + (SECTION_TIMEOUT_MS / 1000) + " s; moving on.");
+              onFail("Still waiting on the source spreadsheet after " + (SECTION_TIMEOUT_MS / 1000) + " s.");
+              finish();
+            }, SECTION_TIMEOUT_MS);
+          }
+          runSafe(function (res) {
+            if (token !== dashToken) { finish(); return; } // another project was selected meanwhile
+            if (res.error) {
+              console.error("Section '" + section + "' failed:", res.error);
+              onFail(res.error);
             } else {
-                document.getElementById('chart_div').innerHTML = '<h3 class="text-center p-10 text-gray-500">ISO No. not found.</h3>';
-                document.getElementById('task_status_chart_div').innerHTML = '<h3 class="text-center p-10 text-gray-500">ISO No. not found.</h3>';
+              onData(res);
             }
+            finish();
+          }).getDashboardSection(projectName, section);
+        };
+        const mergeKpis = function (res) {
+          Object.assign(dashKpis, res.kpis || {});
+          updateKpiDashboard(dashKpis);
+        };
+        const failIds = function (ids, chartId, chartMsg) {
+          return function (err) {
+            ids.forEach(function (id) {
+              const el = document.getElementById(id);
+              if (el) { el.textContent = "—"; el.title = err; }
+            });
+            if (chartId) document.getElementById(chartId).innerHTML = '<h3 class="text-center p-10 text-red-500">' + chartMsg + ': ' + err + '</h3>';
+          };
+        };
 
-          })
-          .getAllDashboardData(projectName);
+        // Different spreadsheets: all at once.
+        fetchSection('header', function (res) {
+          updateProjectDetails(res.details);
+          mergeKpis(res);
+        }, function (err) {
+          alert("Failed to load project data: " + err);
+          failIds(['kpi-order-amount', 'kpi-proj-manager', 'kpi-site-incharge', 'kpi-profit-loss'])(err);
+        });
+        fetchSection('expenses', mergeKpis, failIds(['kpi-expenses', 'kpi-profit-loss']));
+        fetchSection('billing', mergeKpis, failIds(['kpi-billing-milestones', 'kpi-billing-done', 'kpi-billing-pending'], 'payment-chart', 'Could not load payments'));
+        fetchSection('mom', function (res) {
+          momData = res.momData || { headers: [], rows: [] };
+        }, function () {});
+
+        // The bucket spreadsheet: one at a time, smallest first.
+        const bucketSteps = [
+          ['inventory', mergeKpis,
+            failIds(['kpi-manpower-rs', 'kpi-product-rs', 'kpi-profit-loss', 'kpi-indent-planned', 'kpi-actual-indent', 'kpi-received', 'kpi-used'])],
+          ['audit', mergeKpis,
+            failIds(['kpi-audit-manpower', 'kpi-audit-product', 'kpi-audit-drawings'])],
+          ['wbs', function (res) { mergeKpis(res); drawD3Chart(res.timelineChart); },
+            failIds(['kpi-total-milestones', 'kpi-completed-milestones', 'kpi-pending-milestones', 'kpi-milestone-percent'], 'chart_div', 'Could not load timeline')],
+          ['planning', function (res) { mergeKpis(res); drawMilestoneComboChart(res.milestoneChart); },
+            failIds(['kpi-eng-worked', 'kpi-planned-hrs', 'kpi-actual-hrs', 'kpi-total-tasks', 'kpi-tasks-done', 'kpi-tasks-inprogress', 'kpi-tasks-hold'], 'task_status_chart_div', 'Could not load progress')]
+        ];
+        let step = 0;
+        const runNext = function () {
+          if (token !== dashToken || step >= bucketSteps.length) return;
+          const st = bucketSteps[step++];
+          fetchSection(st[0], st[1], st[2], runNext);
+        };
+        runNext();
       }
 
       /**
@@ -1056,7 +1133,7 @@
         timelineModalTitle.textContent = `Timeline Details for: ${projectName}`;
         timelineModalContent.innerHTML = '<div class="text-center p-8"><div class="spinner mx-auto mb-4"></div><p class="text-gray-600">Loading details...</p></div>';
         timelineModal.classList.remove("hidden");
-        google.script.run.withSuccessHandler(renderTimelineTable).getWbsDataForProject(projectName);
+        runSafe(renderTimelineTable).getWbsDataForProject(projectName);
       }
 
       function renderTimelineTable(data) {
@@ -1111,7 +1188,7 @@
         timelineModalTitle.textContent = `Manpower & Engineer Details for: ${projectName}`;
         timelineModalContent.innerHTML = '<div class="text-center p-8"><div class="spinner mx-auto mb-4"></div><p class="text-gray-600">Loading details...</p></div>';
         timelineModal.classList.remove("hidden");
-        google.script.run.withSuccessHandler(renderProjectPlanningTable).getProjectPlanningData(projectName);
+        runSafe(renderProjectPlanningTable).getProjectPlanningData(projectName);
       }
 
       function renderProjectPlanningTable(data) {
@@ -1198,7 +1275,7 @@
         timelineModalTitle.textContent = `Completed Tasks for: ${projectName}`;
         timelineModalContent.innerHTML = '<div class="text-center p-8"><div class="spinner mx-auto mb-4"></div></div>';
         timelineModal.classList.remove("hidden");
-        google.script.run.withSuccessHandler(renderProjectPlanningTable).getFilteredTasks(projectName, "DONE");
+        runSafe(renderProjectPlanningTable).getFilteredTasks(projectName, "DONE");
       }
 
       function openInProgressTasksModal(event) {
@@ -1208,7 +1285,7 @@
         timelineModalTitle.textContent = `In-Progress Tasks for: ${projectName}`;
         timelineModalContent.innerHTML = '<div class="text-center p-8"><div class="spinner mx-auto mb-4"></div></div>';
         timelineModal.classList.remove("hidden");
-        google.script.run.withSuccessHandler(renderProjectPlanningTable).getFilteredTasks(projectName, "IN-PROGRESS");
+        runSafe(renderProjectPlanningTable).getFilteredTasks(projectName, "IN-PROGRESS");
       }
 
       function openHoldTasksModal(event) {
@@ -1218,7 +1295,7 @@
         timelineModalTitle.textContent = `On-Hold Tasks for: ${projectName}`;
         timelineModalContent.innerHTML = '<div class="text-center p-8"><div class="spinner mx-auto mb-4"></div></div>';
         timelineModal.classList.remove("hidden");
-        google.script.run.withSuccessHandler(renderProjectPlanningTable).getFilteredTasks(projectName, "HOLD");
+        runSafe(renderProjectPlanningTable).getFilteredTasks(projectName, "HOLD");
       }
 
       function openEngWorkedModal(event) {
@@ -1228,7 +1305,7 @@
         timelineModalTitle.textContent = `Engineer Work Summary for: ${projectName}`;
         timelineModalContent.innerHTML = '<div class="text-center p-8"><div class="spinner mx-auto mb-4"></div><p class="text-gray-600">Loading summary...</p></div>';
         timelineModal.classList.remove("hidden");
-        google.script.run.withSuccessHandler(renderEngWorkedTable).getEngineerWorkSummary(projectName);
+        runSafe(renderEngWorkedTable).getEngineerWorkSummary(projectName);
       }
 
       function renderEngWorkedTable(data) {
@@ -1386,74 +1463,85 @@
               .text(d => d.label);
       }
 
+      /** Applies whatever KPI values have arrived so far; cards for missing keys keep their spinner. */
       function updateKpiDashboard(kpis) {
         if (!kpis || kpis.error) {
-          console.error(kpis.error || "Failed to load KPI data.");
+          console.error((kpis && kpis.error) || "Failed to load KPI data.");
           return;
         }
 
-        const formatNum = (num) => num.toLocaleString("en-IN");
+        const formatNum = (num) => Number(num || 0).toLocaleString("en-IN");
+        const has = (key) => kpis[key] !== undefined;
+        const setText = (id, key, text) => {
+          if (!has(key)) return;
+          const el = document.getElementById(id);
+          if (el) el.textContent = text !== undefined ? text : formatNum(kpis[key]);
+        };
 
-        document.getElementById("kpi-expenses").textContent = formatNum(kpis.expensesRs || 0);
-        document.getElementById("kpi-manpower-rs").textContent = formatNum(kpis.manpowerUsedRs || 0);
-        document.getElementById("kpi-product-rs").textContent = formatNum(kpis.productUsedRs || 0);
-        document.getElementById("kpi-indent-planned").textContent = formatNum(kpis.indentPlanned || 0);
-        document.getElementById("kpi-actual-indent").textContent = formatNum(kpis.actualIndent || 0);
-        document.getElementById("kpi-received").textContent = formatNum(kpis.received || 0);
-        document.getElementById("kpi-used").textContent = formatNum(kpis.used || 0);
-        document.getElementById("kpi-eng-worked").textContent = formatNum(kpis.engWorked || 0);
-        document.getElementById("kpi-planned-hrs").textContent = formatNum(kpis.plannedManHrs || 0);
-        document.getElementById("kpi-actual-hrs").textContent = formatNum(kpis.actualManHrs || 0);
-        document.getElementById("kpi-audit-manpower").textContent = formatNum(kpis.auditManpower || 0);
-        document.getElementById("kpi-audit-product").textContent = formatNum(kpis.auditProduct || 0);
-        document.getElementById("kpi-audit-drawings").textContent = formatNum(kpis.auditDrawings || 0);
-        document.getElementById("kpi-total-tasks").textContent = formatNum(kpis.totalTasks || 0);
-        document.getElementById("kpi-tasks-done").textContent = formatNum(kpis.tasksDone || 0);
-        document.getElementById("kpi-tasks-inprogress").textContent = formatNum(kpis.tasksInProgress || 0);
-        document.getElementById("kpi-tasks-hold").textContent = formatNum(kpis.tasksOnHold || 0);
-        document.getElementById("kpi-total-milestones").textContent = formatNum(kpis.totalMilestones || 0);
-        document.getElementById("kpi-completed-milestones").textContent = formatNum(kpis.completedMilestones || 0);
-        document.getElementById("kpi-pending-milestones").textContent = formatNum(kpis.pendingMilestones || 0);
-        document.getElementById("kpi-milestone-percent").textContent = (kpis.milestoneDonePercent || 0) + "%";
+        setText("kpi-expenses", "expensesRs");
+        setText("kpi-manpower-rs", "manpowerUsedRs");
+        setText("kpi-product-rs", "productUsedRs");
+        setText("kpi-indent-planned", "indentPlanned");
+        setText("kpi-actual-indent", "actualIndent");
+        setText("kpi-received", "received");
+        setText("kpi-used", "used");
+        setText("kpi-eng-worked", "engWorked");
+        setText("kpi-planned-hrs", "plannedManHrs");
+        setText("kpi-actual-hrs", "actualManHrs");
+        setText("kpi-audit-manpower", "auditManpower");
+        setText("kpi-audit-product", "auditProduct");
+        setText("kpi-audit-drawings", "auditDrawings");
+        setText("kpi-total-tasks", "totalTasks");
+        setText("kpi-tasks-done", "tasksDone");
+        setText("kpi-tasks-inprogress", "tasksInProgress");
+        setText("kpi-tasks-hold", "tasksOnHold");
+        setText("kpi-total-milestones", "totalMilestones");
+        setText("kpi-completed-milestones", "completedMilestones");
+        setText("kpi-pending-milestones", "pendingMilestones");
+        setText("kpi-milestone-percent", "milestoneDonePercent", (kpis.milestoneDonePercent || 0) + "%");
 
-        const totalBillingMilestones = kpis.totalBillingMilestones || 0;
-        const completedBillingMilestones = kpis.completedBillingMilestones || 0;
-        document.getElementById("kpi-billing-milestones").textContent = `${completedBillingMilestones} / ${totalBillingMilestones}`;
-        document.getElementById("kpi-billing-done").textContent = `${kpis.overallBillingDonePercent || 0}%`;
-        document.getElementById("kpi-billing-pending").textContent = `${kpis.overallBillingPendingPercent || 0}%`;
+        if (has("totalBillingMilestones") && has("completedBillingMilestones")) {
+          setText("kpi-billing-milestones", "totalBillingMilestones", `${kpis.completedBillingMilestones || 0} / ${kpis.totalBillingMilestones || 0}`);
+        }
+        setText("kpi-billing-done", "overallBillingDonePercent", `${kpis.overallBillingDonePercent || 0}%`);
+        setText("kpi-billing-pending", "overallBillingPendingPercent", `${kpis.overallBillingPendingPercent || 0}%`);
 
-        document.getElementById("kpi-order-amount").innerHTML = `${formatNum(parseFloat(kpis.orderAmount || 0).toFixed(2))} + GST`;
-        
-        const profitLossEl = document.getElementById("kpi-profit-loss");
-        const profitLossValue = kpis.profitLoss || 0;
-        profitLossEl.textContent = formatNum(profitLossValue.toFixed(2));
-        if (profitLossValue > 0) {
-          profitLossEl.style.color = "#10b981";
-        } else if (profitLossValue < 0) {
-          profitLossEl.style.color = "#ef4444";
-        } else {
-          profitLossEl.style.color = "#334155";
+        if (has("orderAmount")) {
+          document.getElementById("kpi-order-amount").innerHTML = `${formatNum(parseFloat(kpis.orderAmount || 0).toFixed(2))} + GST`;
         }
 
-        document.getElementById("kpi-proj-manager").textContent = kpis.projectManager;
-        document.getElementById('kpi-site-incharge').textContent = kpis.siteIncharge || 'N/A';
-        const poLink = document.getElementById("kpi-po-copy");
-        poLink.href = kpis.poCopy;
-        poLink.textContent = kpis.poCopy ? "View Document" : "N/A";
+        // Profit / loss needs the order amount and all three cost figures.
+        if (["orderAmount", "manpowerUsedRs", "productUsedRs", "expensesRs"].every(has)) {
+          const profitLossEl = document.getElementById("kpi-profit-loss");
+          const profitLossValue = (parseFloat(kpis.orderAmount) || 0) - ((kpis.manpowerUsedRs || 0) + (kpis.productUsedRs || 0) + (kpis.expensesRs || 0));
+          profitLossEl.textContent = formatNum(profitLossValue.toFixed(2));
+          profitLossEl.style.color = profitLossValue > 0 ? "#10b981" : profitLossValue < 0 ? "#ef4444" : "#334155";
+        }
 
-        document.getElementById("pay-advance").textContent = `${kpis.paymentTerms.advance}%`;
-        document.getElementById("pay-pi").textContent = `${kpis.paymentTerms.againstPi}%`;
-        document.getElementById("pay-install").textContent = `${kpis.paymentTerms.installTest}%`;
-        document.getElementById("pay-commission").textContent = `${kpis.paymentTerms.commission}%`;
-        document.getElementById("pay-security").textContent = `${kpis.paymentTerms.security}%`;
+        setText("kpi-proj-manager", "projectManager", kpis.projectManager || "N/A");
+        setText("kpi-site-incharge", "siteIncharge", kpis.siteIncharge || "N/A");
+        if (has("poCopy")) {
+          const poLink = document.getElementById("kpi-po-copy");
+          poLink.href = kpis.poCopy || "#";
+          poLink.textContent = kpis.poCopy && kpis.poCopy !== "#" ? "View Document" : "N/A";
+        }
 
-        const paymentPercent = (kpis.paymentReceivedPercent || 0) * 100;
-        drawDonutChart("payment-chart", paymentPercent, "#10b981", "#fbbf24");
+        if (has("paymentTerms")) {
+          const t = kpis.paymentTerms || {};
+          document.getElementById("pay-advance").textContent = `${t.advance || 0}%`;
+          document.getElementById("pay-pi").textContent = `${t.againstPi || 0}%`;
+          document.getElementById("pay-install").textContent = `${t.installTest || 0}%`;
+          document.getElementById("pay-commission").textContent = `${t.commission || 0}%`;
+          document.getElementById("pay-security").textContent = `${t.security || 0}%`;
+        }
 
-        const paymentContainer = document.getElementById("payment-chart-container");
-        if (paymentContainer && !paymentContainer.hasAttribute("data-listener-added")) {
-          paymentContainer.addEventListener("click", openFinanceModal);
-          paymentContainer.setAttribute("data-listener-added", "true");
+        if (has("paymentReceivedPercent")) {
+          drawDonutChart("payment-chart", (kpis.paymentReceivedPercent || 0) * 100, "#10b981", "#fbbf24");
+          const paymentContainer = document.getElementById("payment-chart-container");
+          if (paymentContainer && !paymentContainer.hasAttribute("data-listener-added")) {
+            paymentContainer.addEventListener("click", openFinanceModal);
+            paymentContainer.setAttribute("data-listener-added", "true");
+          }
         }
       }
 
@@ -1610,7 +1698,7 @@
         timelineModalTitle.textContent = `Inventory & Product Status for: ${projectName}`;
         timelineModalContent.innerHTML = '<div class="text-center p-8"><div class="animate-spin h-8 w-8 border-b-2"></div><p>Loading...</p></div>';
         timelineModal.classList.remove('hidden');
-        google.script.run.withSuccessHandler(renderInventorySummaryView).getInventoryData(projectName);
+        runSafe(renderInventorySummaryView).getInventoryData(projectName);
       }
 
       // --- NEW: FUNCTIONS TO OPEN MODAL FOR MANPOWER COST DATA ---
@@ -1629,7 +1717,7 @@
         timelineModal.classList.remove('hidden');
 
         // Call the server-side function for Manpower Cost data
-        google.script.run.withSuccessHandler(renderManpowerCostTable).getManpowerCostData(projectName);
+        runSafe(renderManpowerCostTable).getManpowerCostData(projectName);
       }
 
       // --- NEW: FUNCTIONS TO OPEN MODAL FOR FINANCE DATA ---
@@ -1644,7 +1732,7 @@
         timelineModalTitle.textContent = `Payment Details for: ${projectName}`;
         timelineModalContent.innerHTML = '<div class="text-center p-8"><div class="animate-spin h-8 w-8 border-b-2"></div></div>';
         timelineModal.classList.remove('hidden');
-        google.script.run.withSuccessHandler(renderFinanceSummaryView).getFinanceData(projectName);
+        runSafe(renderFinanceSummaryView).getFinanceData(projectName);
       }
 
        /**
@@ -1657,7 +1745,7 @@
         timelineModalTitle.textContent = `Billing Status for: ${projectName}`;
         timelineModalContent.innerHTML = '<div class="text-center p-8"><div class="animate-spin h-8 w-8 border-b-2"></div></div>';
         timelineModal.classList.remove('hidden');
-        google.script.run.withSuccessHandler(renderBillingSummaryView).getBillingData(projectName);
+        runSafe(renderBillingSummaryView).getBillingData(projectName);
       }
 
       // --- NEW: FUNCTIONS TO OPEN MODAL FOR PROJECT DETAILS FORM DATA ---
@@ -1712,7 +1800,7 @@
             timelineModalContent.innerHTML = detailHtml;
         };
 
-        google.script.run.withSuccessHandler(renderDetailsView).getProjectDetailsFormData(projectName);
+        runSafe(renderDetailsView).getProjectDetailsFormData(projectName);
       }
 
       // --- NEW: FUNCTIONS TO OPEN MODAL FOR AUDIT DATA ---
@@ -1726,7 +1814,7 @@
         timelineModalTitle.textContent = `Manpower Audit Details for: ${projectName}`;
         timelineModalContent.innerHTML = '<div class="text-center p-8"><div class="animate-spin rounded-full h-8 w-8 border-b-2 border-gray-900 inline-block"></div><p>Loading details...</p></div>';
         timelineModal.classList.remove('hidden');
-        google.script.run.withSuccessHandler(renderAuditManpowerTable).getAuditManpowerData(projectName);
+        runSafe(renderAuditManpowerTable).getAuditManpowerData(projectName);
       }
 
       /**
@@ -1738,7 +1826,7 @@
         timelineModalTitle.textContent = `Product/Item Audit Details for: ${projectName}`;
         timelineModalContent.innerHTML = '<div class="text-center p-8"><div class="animate-spin rounded-full h-8 w-8 border-b-2 border-gray-900 inline-block"></div><p>Loading details...</p></div>';
         timelineModal.classList.remove('hidden');
-        google.script.run.withSuccessHandler(renderAuditItemTable).getAuditItemData(projectName);
+        runSafe(renderAuditItemTable).getAuditItemData(projectName);
       }
 
       /**
@@ -1750,7 +1838,7 @@
         timelineModalTitle.textContent = `Drawing Audit Details for: ${projectName}`;
         timelineModalContent.innerHTML = '<div class="text-center p-8"><div class="animate-spin rounded-full h-8 w-8 border-b-2 border-gray-900 inline-block"></div><p>Loading details...</p></div>';
         timelineModal.classList.remove('hidden');
-        google.script.run.withSuccessHandler(renderAuditDrawingTable).getAuditDrawingData(projectName);
+        runSafe(renderAuditDrawingTable).getAuditDrawingData(projectName);
       }
 
       /**
@@ -1783,7 +1871,7 @@
         timelineModal.classList.remove('hidden');
 
         // Reuse the WBS data fetching function we created at the start
-        google.script.run.withSuccessHandler(renderTimelineTable).getWbsDataForProject(projectName);
+        runSafe(renderTimelineTable).getWbsDataForProject(projectName);
       }
 
       // --- NEW: FUNCTIONS FOR PRODUCT USED DETAILS MODAL ---
@@ -1800,7 +1888,7 @@
         timelineModalContent.innerHTML = '<div class="text-center p-8"><div class="animate-spin rounded-full h-8 w-8 border-b-2 border-gray-900 inline-block"></div><p>Loading details...</p></div>';
         timelineModal.classList.remove('hidden');
 
-        google.script.run.withSuccessHandler(renderProductUsedTable).getProductUsedData(projectName);
+        runSafe(renderProductUsedTable).getProductUsedData(projectName);
       }
 
       /**
@@ -1815,7 +1903,7 @@
         timelineModalContent.innerHTML = '<div class="text-center p-8"><div class="animate-spin rounded-full h-8 w-8 border-b-2 border-gray-900 inline-block"></div><p>Loading details...</p></div>';
         timelineModal.classList.remove('hidden');
 
-        google.script.run.withSuccessHandler(renderExpenseView).getExpenseDetailsData(projectName);
+        runSafe(renderExpenseView).getExpenseDetailsData(projectName);
       }
 
       /**
@@ -1830,7 +1918,7 @@
         timelineModalContent.innerHTML = '<div class="text-center p-8"><div class="animate-spin rounded-full h-8 w-8 border-b-2 border-gray-900 inline-block"></div><p>Loading details...</p></div>';
         timelineModal.classList.remove('hidden');
 
-        google.script.run.withSuccessHandler(renderPlannedHrsTable).getPlannedHrsData(projectName);
+        runSafe(renderPlannedHrsTable).getPlannedHrsData(projectName);
       }
 
       /**
@@ -1845,7 +1933,7 @@
         timelineModalContent.innerHTML = '<div class="text-center p-8"><div class="animate-spin rounded-full h-8 w-8 border-b-2 border-gray-900 inline-block"></div><p>Loading details...</p></div>';
         timelineModal.classList.remove('hidden');
 
-        google.script.run.withSuccessHandler(renderActualHrsTable).getActualHrsData(projectName);
+        runSafe(renderActualHrsTable).getActualHrsData(projectName);
       }
 
       // --- NEW: FUNCTIONS FOR FILTERED MILESTONE LISTS ---
@@ -1862,7 +1950,7 @@
         timelineModalContent.innerHTML = '<div class="text-center p-8"><div class="animate-spin rounded-full h-8 w-8 border-b-2 border-gray-900 inline-block"></div><p>Loading details...</p></div>';
         timelineModal.classList.remove('hidden');
 
-        google.script.run.withSuccessHandler(renderMilestoneList).getFilteredMilestones(projectName, 'COMPLETED');
+        runSafe(renderMilestoneList).getFilteredMilestones(projectName, 'COMPLETED');
       }
 
       /**
@@ -1877,7 +1965,7 @@
         timelineModalContent.innerHTML = '<div class="text-center p-8"><div class="animate-spin rounded-full h-8 w-8 border-b-2 border-gray-900 inline-block"></div><p>Loading details...</p></div>';
         timelineModal.classList.remove('hidden');
 
-        google.script.run.withSuccessHandler(renderMilestoneList).getFilteredMilestones(projectName, 'PENDING');
+        runSafe(renderMilestoneList).getFilteredMilestones(projectName, 'PENDING');
       }
 
       // --- NEW: FUNCTIONS FOR FILTERED INVENTORY VIEWS ---
@@ -1889,7 +1977,7 @@
         timelineModalTitle.textContent = `Planned Indent Details for: ${projectName}`;
         timelineModalContent.innerHTML = '<div class="text-center p-8"><div class="animate-spin h-8 w-8 border-b-2"></div><p>Loading...</p></div>';
         timelineModal.classList.remove('hidden');
-        google.script.run.withSuccessHandler(data => renderFilteredInventoryTable(data, ['MILESTONE', 'PRODUCT NAME', 'Planned Indent Qty']))
+        runSafe(data => renderFilteredInventoryTable(data, ['MILESTONE', 'PRODUCT NAME', 'Planned Indent Qty']))
             .getFilteredInventoryData(projectName, 'Planned Indent Qty');
       }
 
@@ -1900,7 +1988,7 @@
         timelineModalTitle.textContent = `Actual Indent Details for: ${projectName}`;
         timelineModalContent.innerHTML = '<div class="text-center p-8"><div class="animate-spin h-8 w-8 border-b-2"></div><p>Loading...</p></div>';
         timelineModal.classList.remove('hidden');
-        google.script.run.withSuccessHandler(data => renderFilteredInventoryTable(data, ['MILESTONE', 'PRODUCT NAME', 'INDENT1']))
+        runSafe(data => renderFilteredInventoryTable(data, ['MILESTONE', 'PRODUCT NAME', 'INDENT1']))
             .getFilteredInventoryData(projectName, 'INDENT1');
       }
 
@@ -1911,7 +1999,7 @@
         timelineModalTitle.textContent = `Received Items Details for: ${projectName}`;
         timelineModalContent.innerHTML = '<div class="text-center p-8"><div class="animate-spin h-8 w-8 border-b-2"></div><p>Loading...</p></div>';
         timelineModal.classList.remove('hidden');
-        google.script.run.withSuccessHandler(data => renderFilteredInventoryTable(data, ['MILESTONE', 'PRODUCT NAME', 'REC.1']))
+        runSafe(data => renderFilteredInventoryTable(data, ['MILESTONE', 'PRODUCT NAME', 'REC.1']))
             .getFilteredInventoryData(projectName, 'REC.1');
       }
 
@@ -1922,7 +2010,7 @@
         timelineModalTitle.textContent = `Used/Consumed Items Details for: ${projectName}`;
         timelineModalContent.innerHTML = '<div class="text-center p-8"><div class="animate-spin h-8 w-8 border-b-2"></div><p>Loading...</p></div>';
         timelineModal.classList.remove('hidden');
-        google.script.run.withSuccessHandler(data => renderFilteredInventoryTable(data, ['MILESTONE', 'PRODUCT NAME', 'CONSU.1']))
+        runSafe(data => renderFilteredInventoryTable(data, ['MILESTONE', 'PRODUCT NAME', 'CONSU.1']))
             .getFilteredInventoryData(projectName, 'CONSU.1');
       }
 
@@ -2117,7 +2205,7 @@
         timelineModalTitle.textContent = `Completed Billings for: ${projectName}`;
         timelineModalContent.innerHTML = '<div class="text-center p-8"><div class="animate-spin h-8 w-8 border-b-2"></div></div>';
         timelineModal.classList.remove('hidden');
-        google.script.run.withSuccessHandler(renderBillingSummaryView).getFilteredBillingData(projectName, 'DONE');
+        runSafe(renderBillingSummaryView).getFilteredBillingData(projectName, 'DONE');
       }
 
        function openBillingPendingModal(event) {
@@ -2127,7 +2215,7 @@
         timelineModalTitle.textContent = `Pending Billings for: ${projectName}`;
         timelineModalContent.innerHTML = '<div class="text-center p-8"><div class="animate-spin h-8 w-8 border-b-2"></div></div>';
         timelineModal.classList.remove('hidden');
-        google.script.run.withSuccessHandler(renderBillingSummaryView).getFilteredBillingData(projectName, 'PENDING');
+        runSafe(renderBillingSummaryView).getFilteredBillingData(projectName, 'PENDING');
       }
 
       /**
@@ -2860,7 +2948,7 @@
           } else {
               timelineModalContent.innerHTML = '<p class="text-yellow-500">Loading full task details...</p>';
               // Fallback: If projectPlanningData isn't loaded for some reason, we can fetch it.
-              google.script.run.withSuccessHandler(data => {
+              runSafe(data => {
                   projectPlanningData = data;
                   showTaskProgressDetails(rowIndex); // Try again
               }).getProjectPlanningData(document.getElementById('project-name').value);
