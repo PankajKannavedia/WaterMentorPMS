@@ -1028,20 +1028,21 @@
         momData = { headers: [], rows: [] };
         const SECTION_TIMEOUT_MS = 90000;
 
-        const fetchSection = function (section, onData, onFail, next) {
+        const fetchSection = function (section, onData, onFail, next, timeoutMs) {
           let finished = false, timer = null;
+          const limit = timeoutMs || SECTION_TIMEOUT_MS;
           const finish = function () {
             if (finished) return;
             finished = true;
             if (timer) clearTimeout(timer);
             if (next) next();
           };
-          if (next) {
+          if (next || timeoutMs) {
             timer = setTimeout(function () {
-              console.error("Section '" + section + "' is taking over " + (SECTION_TIMEOUT_MS / 1000) + " s; moving on.");
-              onFail("Still waiting on the source spreadsheet after " + (SECTION_TIMEOUT_MS / 1000) + " s.");
+              console.error("Section '" + section + "' is taking over " + (limit / 1000) + " s; giving up waiting (a late answer still fills the card).");
+              onFail("Still waiting on the source spreadsheet after " + (limit / 1000) + " s.");
               finish();
-            }, SECTION_TIMEOUT_MS);
+            }, limit);
           }
           runSafe(function (res) {
             if (token !== dashToken) { finish(); return; } // another project was selected meanwhile
@@ -1082,14 +1083,19 @@
           momData = res.momData || { headers: [], rows: [] };
         }, function () {});
 
-        // The bucket spreadsheet: one at a time, smallest first.
+        // WBS is the only section that reads the slow STP CIVIL source spreadsheet directly (up to a
+        // minute or more), so it runs on its own, in parallel, and never holds up the other cards.
+        document.getElementById('chart_div').innerHTML = '<div class="flex flex-col items-center justify-center h-64"><div class="spinner mb-2"></div><p class="text-sm text-gray-500">Loading Timeline from the source sheets (can take up to a minute)...</p></div>';
+        fetchSection('wbs', function (res) { mergeKpis(res); drawD3Chart(res.timelineChart); },
+          failIds(['kpi-total-milestones', 'kpi-completed-milestones', 'kpi-pending-milestones', 'kpi-milestone-percent'], 'chart_div', 'Could not load timeline'),
+          null, 240000);
+
+        // Inventory, audit and planning come from the common sheet: one after another.
         const bucketSteps = [
           ['inventory', mergeKpis,
             failIds(['kpi-manpower-rs', 'kpi-product-rs', 'kpi-profit-loss', 'kpi-indent-planned', 'kpi-actual-indent', 'kpi-received', 'kpi-used'])],
           ['audit', mergeKpis,
             failIds(['kpi-audit-manpower', 'kpi-audit-product', 'kpi-audit-drawings'])],
-          ['wbs', function (res) { mergeKpis(res); drawD3Chart(res.timelineChart); },
-            failIds(['kpi-total-milestones', 'kpi-completed-milestones', 'kpi-pending-milestones', 'kpi-milestone-percent'], 'chart_div', 'Could not load timeline')],
           ['planning', function (res) { mergeKpis(res); drawMilestoneComboChart(res.milestoneChart); },
             failIds(['kpi-eng-worked', 'kpi-planned-hrs', 'kpi-actual-hrs', 'kpi-total-tasks', 'kpi-tasks-done', 'kpi-tasks-inprogress', 'kpi-tasks-hold'], 'task_status_chart_div', 'Could not load progress')]
         ];
@@ -1870,8 +1876,22 @@
         timelineModalContent.innerHTML = '<div class="text-center p-8"><div class="spinner border-t-blue-600"></div><p>Loading WBS details...</p></div>';
         timelineModal.classList.remove('hidden');
 
-        // Reuse the WBS data fetching function we created at the start
-        runSafe(renderTimelineTable).getWbsDataForProject(projectName);
+        // Same source as the Milestone Summary card (PROJECT PLANNING task status per milestone)
+        runSafe(renderMilestoneDetails).getMilestoneDetailsData(projectName);
+      }
+
+      function renderMilestoneDetails(data) {
+        if (!data || data.error) {
+          timelineModalContent.innerHTML = `<p class="text-red-500 font-semibold">Error: ${(data && data.error) || 'Could not load milestones'}</p>`;
+          return;
+        }
+        if (!data.length) {
+          timelineModalContent.innerHTML = '<p class="text-gray-600">No milestone data found for this project.</p>';
+          return;
+        }
+        const esc = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;');
+        const body = data.map((m) => `<tr class="border-t"><td class="p-2">${esc(m.milestone)}</td><td class="p-2 text-center">${m.total}</td><td class="p-2 text-center">${m.done}</td><td class="p-2 text-center">${m.pending}</td><td class="p-2 text-center">${m.pending === 0 ? 'Completed' : 'Pending'}</td></tr>`).join('');
+        timelineModalContent.innerHTML = `<table class="w-full text-sm"><thead><tr class="text-left bg-gray-50"><th class="p-2">Milestone</th><th class="p-2 text-center">Tasks</th><th class="p-2 text-center">Done</th><th class="p-2 text-center">Pending</th><th class="p-2 text-center">Status</th></tr></thead><tbody>${body}</tbody></table>`;
       }
 
       // --- NEW: FUNCTIONS FOR PRODUCT USED DETAILS MODAL ---

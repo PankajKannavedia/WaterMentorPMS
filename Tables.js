@@ -56,7 +56,7 @@ function buildTable_(ctx, name, opts) {
     const hIdx = headerIdx_(name);
     if (!t.length) throw new Error("Required sheet '" + name + "' not found or empty.");
     const hdr = (t[hIdx] || []).map(h => String(h).trim());
-    const ci = isoColIdx_(hdr);
+    const ci = isoColIdx_(hdr, name);
     if (ci === -1) throw new Error("'ISO No.' column not found in '" + name + "'.");
 
     let rows = t.slice(hIdx + 1).filter(r => cleanIso(r[ci]) === ctx.isoNo);
@@ -242,7 +242,7 @@ function momTable_(isoNo) {
     const t = loadSources_(['MOM'], SpreadsheetApp.getActiveSpreadsheet(), null, { formatted: true, iso: iso })['MOM'];
     if (!t.length) return { headers: [], rows: [] };
     const hdr = t[0].map(h => String(h).trim());
-    const ci = isoColIdx_(hdr);
+    const ci = isoColIdx_(hdr, 'MOM');
     if (ci === -1) throw new Error("'ISO No.' column not found in 'MOM' sheet.");
     const rows = t.slice(1).filter(r => cleanIso(r[ci]) === iso);
     resolveLinks_('MOM', hdr, rows, [

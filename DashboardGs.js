@@ -54,6 +54,82 @@ function debugProject(projectName) {
 }
 
 /**
+ * READ-ONLY. Run from the editor of the script bound to the common sheet. For every tab of
+ * this spreadsheet it logs size, whether the app code still reads it, and which other tabs'
+ * formulas mention it (first 60 rows of each tab are scanned), then lists the tabs that are
+ * safe to hide: not read by the code and not needed (directly or through a chain of formulas)
+ * by a tab that is. Nothing is changed. Formulas can also use INDIRECT or named ranges, which
+ * this cannot see, so hide first (hideUnusedTabs) and delete only after a few days.
+ */
+function auditCommonSheet() {
+  const plan = commonSheetPlan_();
+  plan.tabs.forEach(t => {
+    Logger.log((t.needed ? 'KEEP   ' : 'UNUSED ') + t.name + ' (' + t.rows + 'x' + t.cols + (t.hidden ? ', hidden' : '') + ')' +
+      (t.inUse ? ' | code reads it: ' + t.inUse : '') +
+      (t.referencedBy.length ? ' | formulas in: ' + t.referencedBy.join(', ') : '') +
+      (!t.inUse && t.needed ? ' | kept only because a needed tab refers to it' : ''));
+  });
+  Logger.log('Safe to hide (' + plan.unused.length + '): ' + JSON.stringify(plan.unused));
+}
+
+/** Hides the unused tabs found by auditCommonSheet. Reversible: showAllTabs() unhides every tab. */
+function hideUnusedTabs() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const plan = commonSheetPlan_();
+  let hidden = 0;
+  plan.unused.forEach(name => {
+    const sh = ss.getSheetByName(name);
+    const visible = ss.getSheets().filter(s => !s.isSheetHidden()).length;
+    if (sh && !sh.isSheetHidden() && visible > 1) { sh.hideSheet(); hidden++; }
+  });
+  Logger.log('Hid ' + hidden + ' tab(s): ' + JSON.stringify(plan.unused));
+}
+
+function showAllTabs() {
+  SpreadsheetApp.getActiveSpreadsheet().getSheets().forEach(sh => { if (sh.isSheetHidden()) sh.showSheet(); });
+  Logger.log('All tabs visible again.');
+}
+
+function commonSheetPlan_() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheets = ss.getSheets();
+  const names = sheets.map(s => s.getName());
+
+  // Tabs the server code still reads from this spreadsheet.
+  const inUse = { 'Doer list': 'login', 'Project Details Form': 'Product / Site incharge columns and lookups', 'FINANCE/ACCOUNTS': 'payment received %' };
+  Object.keys(SOURCES).forEach(n => { if (!isDirect_(n)) inUse[n] = 'dashboard data (still read from this sheet)'; });
+
+  // Which tabs' formulas mention which tab.
+  const referencedBy = {};
+  names.forEach(n => { referencedBy[n] = []; });
+  sheets.forEach(sh => {
+    const rows = Math.min(sh.getLastRow(), 60), cols = sh.getLastColumn();
+    if (!rows || !cols) return;
+    const text = sh.getRange(1, 1, rows, cols).getFormulas().map(r => r.join('\n')).join('\n');
+    names.forEach(n => {
+      if (n !== sh.getName() && (text.indexOf(n + '!') > -1 || text.indexOf("'" + n + "'!") > -1)) referencedBy[n].push(sh.getName());
+    });
+  });
+
+  // needed = read by the code, or referenced by a needed tab (repeat until nothing changes).
+  const needed = {};
+  names.forEach(n => { if (inUse[n]) needed[n] = true; });
+  let changed = true;
+  while (changed) {
+    changed = false;
+    names.forEach(n => {
+      if (!needed[n] && referencedBy[n].some(y => needed[y])) { needed[n] = true; changed = true; }
+    });
+  }
+
+  const tabs = sheets.map(sh => ({
+    name: sh.getName(), rows: sh.getLastRow(), cols: sh.getLastColumn(), hidden: sh.isSheetHidden(),
+    inUse: inUse[sh.getName()] || '', referencedBy: referencedBy[sh.getName()], needed: !!needed[sh.getName()]
+  }));
+  return { tabs: tabs, unused: tabs.filter(t => !t.needed).map(t => t.name) };
+}
+
+/**
  * Run from the editor of the script bound to the COMMON sheet. Prints, for every tab the
  * dashboard reads, the first three rows exactly as the old IMPORTRANGE-based tabs had them
  * (row 1-2 are often typed headers that do not exist in the source spreadsheets), plus the
@@ -142,6 +218,42 @@ function getDashboardSection(projectName, section) {
     const kpis = calculateKpisInMemory(ctx.isoNo, allData);
     out.kpis = {};
     def.keys.forEach(k => { out.kpis[k] = kpis[k] === undefined ? null : kpis[k]; });
+
+    // Cards use the same reads as their detail modals (formatted INVENTORY, PROJECT PLANNING milestones).
+    if (section === 'inventory') {
+      const inv = projectTab_(ctx, 'INVENTORY', true);
+      const hIdx = headerIdx_('INVENTORY');
+      const hdr = (inv[hIdx] || []).map(h => String(h).trim());
+      const ci = isoColIdx_(hdr, 'INVENTORY');
+      const rows = ci === -1 ? [] : inv.slice(hIdx + 1).filter(r => cleanIso(r[ci]) === ctx.isoNo);
+      const sum = col => {
+        const i = hdr.indexOf(col);
+        return i === -1 ? 0 : rows.reduce((s, r) => s + (parseFloat(String(r[i]).replace(/,/g, '')) || 0), 0);
+      };
+      out.kpis.indentPlanned = sum('Planned Indent Qty');
+      out.kpis.actualIndent = sum('INDENT1');
+      out.kpis.received = sum('REC.1');
+      out.kpis.used = sum('CONSU.1');
+      Logger.log('inventory KPI: rows=' + rows.length + ' isoCol=' + ci + ' hdr=' + JSON.stringify(hdr.slice(0, hdr.length - META_COLS)) +
+        ' sums=' + [out.kpis.indentPlanned, out.kpis.actualIndent, out.kpis.received, out.kpis.used].join('/'));
+    }
+    if (section === 'wbs' && !out.kpis.totalMilestones) {
+      const t = projectTab_(ctx, 'PROJECT PLANNING', false);
+      const hdr = (t[0] || []).map(h => String(h).trim());
+      const iso = isoColIdx_(hdr), mile = hdr.indexOf('Milestone'), st = hdr.indexOf('Status');
+      if (iso > -1 && mile > -1 && st > -1) {
+        const m = {};
+        t.slice(1).filter(r => cleanIso(r[iso]) === ctx.isoNo && r[mile]).forEach(r => {
+          const g = m[r[mile]] = m[r[mile]] || { all: true };
+          if (statusOf_(r[st]) !== 'DONE') g.all = false;
+        });
+        const names = Object.keys(m), done = names.filter(n => m[n].all).length;
+        out.kpis.totalMilestones = names.length;
+        out.kpis.completedMilestones = done;
+        out.kpis.pendingMilestones = names.length - done;
+        out.kpis.milestoneDonePercent = names.length ? Math.round(done / names.length * 100) : 0;
+      }
+    }
 
     if (section === 'wbs') out.timelineChart = calculateTimelineChartInMemory(ctx.isoNo, allData['WBS Sheet']);
     if (section === 'planning') out.milestoneChart = calculateMilestoneChartInMemory(ctx.isoNo, allData['PROJECT PLANNING'], allData['Billing']);

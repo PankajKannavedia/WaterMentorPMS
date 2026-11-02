@@ -41,7 +41,8 @@ const MOM_SPREADSHEET_ID = '13ZZ-xJvQOvEXDGiEKxL7b1nhzIgfr2gZvtmcHJLaOOw';
  */
 const SOURCES = {
   'PROJECT PLANNING':       { ids: PROJECT_SPREADSHEET_IDS, tab: 'PROJECT PLANNING', blocks: ['A:T'],  headerRows: [1],    dataStart: 2, byIso: true },
-  'Manpower Cost':          { ids: PROJECT_SPREADSHEET_IDS, tab: 'Manpower Cost',    blocks: ['A:C'],  headerRows: [1],    dataStart: 2, byIso: true },
+  // Common sheet: header from the first spreadsheet's row 1, then A2:C of the rest, WHERE Col1 IS NOT NULL.
+  'Manpower Cost':          { ids: PROJECT_SPREADSHEET_IDS, tab: 'Manpower Cost',    blocks: ['A:C'],  headerRows: [1],    dataStart: 2, byIso: true, requireFirstCol: true },
   // Common sheet: =QUERY(VSTACK(IFERROR(IMPORTRANGE(<each of the 9>, "INVENTORY!A3:X50000"),)...), "SELECT * WHERE Col1 IS NOT NULL", 0)
   // Both header rows are typed there; data starts at source row 3.
   'INVENTORY':              { ids: PROJECT_SPREADSHEET_IDS, tab: 'INVENTORY',        blocks: ['A:X'],  headerRows: [1, 2], dataStart: 3, byIso: true,
@@ -50,8 +51,20 @@ const SOURCES = {
                                 ['ISO NO.', 'MILESTONE', 'TASK', 'PRODUCT NAME', 'BOQ/TENDER1', 'INDENT1', 'REC.1', 'CONSU.1', 'AVAIL.1', 'BOQ/TENDER2', 'INDENT2', 'REC.2', 'CONSU.2', 'AVAIL.2', 'MILESTONE', 'TASK', 'INDENT NO.', 'Qty', 'PO NO', 'VENDOR', 'DISPATCH DET.', 'EXPECTED DATE OF REC.', 'ISO No.', 'Planned Indent Qty']
                               ],
                               requireFirstCol: true },
-  'Auditor Sheet Manpower': { ids: PROJECT_SPREADSHEET_IDS, tab: 'Auditor Sheet',    blocks: ['A:J'],  headerRows: [1, 2], dataStart: 3, byIso: true },
-  'Auditor Sheet Item':     { ids: PROJECT_SPREADSHEET_IDS, tab: 'Auditor Sheet',    blocks: ['K:U'],  headerRows: [1, 2], dataStart: 3, byIso: true },
+  // The common sheet imports spreadsheet 1mc9... twice for the three Auditor tabs (a copy-paste slip), which
+  // double-counts that spreadsheet's rows; here every spreadsheet is read once.
+  'Auditor Sheet Manpower': { ids: PROJECT_SPREADSHEET_IDS, tab: 'Auditor Sheet',    blocks: ['A:J'],  headerRows: [1, 2], dataStart: 3, byIso: true, requireFirstCol: true,
+                              headers: [
+                                ['Automatic Data From WBS(Milestones)', '', '', '', '', '', 'Manpower Audit', '', '', ''],
+                                ['ISO No.', 'Project Name', 'End Date', 'Milestone', 'Task', 'Image/Reference', 'As per (Planning Sheet)', 'Actual', 'Deviation', 'Remark']
+                              ] },
+  'Auditor Sheet Item':     { ids: PROJECT_SPREADSHEET_IDS, tab: 'Auditor Sheet',    blocks: ['K:U'],  headerRows: [1, 2], dataStart: 3, byIso: true, requireFirstCol: true,
+                              headers: [
+                                ['', 'Automatic Data From WIP', '', '', '', '', '', 'Item Audit', '', '', ''],
+                                ['ISO No.', 'ISO No._company', 'End Date', 'Milestone', 'Task', 'Item/ Product', 'Received Qty', 'Item As per Tender', 'Item Consumed', 'Deviation', 'Remark']
+                              ] },
+  // NOT switchable: in the common sheet columns G-J (Drawing Attachment, Deviation, Final Drawing, Remark) sit
+  // beside this 6-column import and are typed by hand, so the source spreadsheets do not have them.
   'Auditor Sheet Drawing':  { ids: PROJECT_SPREADSHEET_IDS, tab: 'Auditor Sheet',    blocks: ['W:AB'], headerRows: [1, 2], dataStart: 3, byIso: true },
   // Same as the common sheet's =LET(VSTACK(IMPORTRANGE(... "WBS Sheet!A4:M")...), FILTER(data, col 1 <> "")):
   // headers are typed there (not read from the source) and rows without a first cell are dropped.
@@ -61,7 +74,9 @@ const SOURCES = {
                               skipIds: ['1UT-W4K_i4rNYxMBB0DW23Qla1QPkHPaHoJKsp7u5DD0'] },
   'Project Details Form':   { ids: ['1GrciDwR0Qcc1HKrm34bOeGKwEjyqH9BlDuTFDRM1N8U'], tab: 'Project_Details', blocks: ['A:AC'], headerRows: [1], dataStart: 2, byIso: true },
   'Expenses':               { ids: ['1uHi7hEW69NyNG2hNrUmY6Qh6XFKoBKeCvE9zGbT6bKo'], tab: 'Journal',         blocks: ['A:G'],  headerRows: [1], dataStart: 2, byIso: true },
-  'Billing':                { ids: ['1mQyuZNKhM4d2n_ARCBd_IUcuwEnrUNl-I_lzF_lfozg'], tab: 'FMS.',            blocks: ['A:N', 'AE:AE'], headerRows: [8], dataStart: 9, byIso: true },
+  // Common sheet: importrange(FMS.!A9:N) + the Status5 column from AE; headers typed there (its P:R are a SPLIT of col D, unused).
+  'Billing':                { ids: ['1mQyuZNKhM4d2n_ARCBd_IUcuwEnrUNl-I_lzF_lfozg'], tab: 'FMS.',            blocks: ['A:N', 'AE:AE'], headerRows: [8], dataStart: 9, byIso: true,
+                              headers: [['Timestamp', 'Indentor', 'Division', 'ISO NO', 'Milestones', 'Billing Type', 'Product', 'Project Name', 'Billing Value', 'Remarks', 'Supp Doc', 'Sales Person', 'Billing Freq', 'Billing Stage', 'Status5']] },
   'MOM':                    { ids: [MOM_SPREADSHEET_ID],                              tab: 'Response',        blocks: ['A:AS'], headerRows: [1], dataStart: 2, byIso: true }
 };
 
@@ -73,8 +88,12 @@ const SOURCES = {
 const LOCAL_TABS = {
   'PROJECT PLANNING': true, 'Manpower Cost': true, 'INVENTORY': true,
   'Auditor Sheet Manpower': true, 'Auditor Sheet Item': true, 'Auditor Sheet Drawing': true,
-  'WBS Sheet': true, 'Billing': true, 'Expenses': true, 'MOM': true,
-  'Project Details Form': true // the common sheet's copy has the extra 'item' column the Product field reads
+  'Expenses': true,
+  'Project Details Form': true, // the common sheet's copy has the extra 'item' column the Product field reads
+  // Temporarily back on the common sheet: the direct read of the heavy STP CIVIL spreadsheet takes 1-3 min and
+  // slows every other card. Trade-off: the common sheet has 0 WBS rows for STP CIVIL projects (empty timeline).
+  'WBS Sheet': true
+  // Switched to their source spreadsheets: 'Billing' (compareSources MATCH, 2/2 rows), 'MOM' (MATCH, 22/22 rows).
 };
 /** Header rows at the top of a common-sheet tab (default 1). */
 const LOCAL_HEADER_ROWS = { 'INVENTORY': 2, 'Auditor Sheet Manpower': 2, 'Auditor Sheet Item': 2, 'Auditor Sheet Drawing': 2 };
@@ -163,8 +182,18 @@ function cacheKey_(name, projectIds, opts) {
   return key;
 }
 
-/** ISO column header, tolerant of "ISO No.", "ISO NO", "ISO NO." (but not "ISO No 2"). */
-function isoColIdx_(hdr) {
+/**
+ * Tabs with more than one ISO-like column need the right one pinned: MOM has "ISO No" (project
+ * text) before the clean "ISO No."; Billing has "ISO NO" (full ISO) before a partial "ISO No.".
+ */
+const ISO_HEADER = { 'MOM': 'ISO No.', 'Billing': 'ISO NO' };
+
+/** ISO column header, tolerant of "ISO No.", "ISO NO", "ISO NO." (but not "ISO No 2"); name pins per-tab. */
+function isoColIdx_(hdr, name) {
+  const pinned = name && ISO_HEADER[name];
+  if (pinned) {
+    for (let i = 0; i < hdr.length; i++) if (String(hdr[i]).trim() === pinned) return i;
+  }
   for (let i = 0; i < hdr.length; i++) {
     if (String(hdr[i]).trim().toUpperCase().replace(/\.$/, '') === 'ISO NO') return i;
   }
@@ -173,7 +202,7 @@ function isoColIdx_(hdr) {
 
 function filterByIso_(name, data, iso, forceSource) {
   const hIdx = headerCount_(name, forceSource) - 1;
-  const ci = isoColIdx_(data[hIdx] || []);
+  const ci = isoColIdx_(data[hIdx] || [], name);
   if (ci === -1) return data;
   return data.slice(0, hIdx + 1).concat(data.slice(hIdx + 1).filter(r => cleanIso(r[ci]) === iso));
 }
@@ -360,7 +389,7 @@ function sheetsRetry_(label, fn) {
     try {
       return fn();
     } catch (e) {
-      const transient = /unavailable|timed out|timeout|internal error|backend error|rate limit|quota|(500|502|503|504)/i.test(e.message);
+      const transient = /unavailable|timed out|timeout|internal error|backend error|rate limit|quota|\b(500|502|503|504)\b/i.test(e.message);
       if (!transient || i >= RETRY_WAITS_MS.length || Date.now() - t > 20000) throw e;
       Logger.log(label + ': attempt ' + (i + 1) + ' failed (' + e.message + '), retrying');
       Utilities.sleep(RETRY_WAITS_MS[i]);
@@ -735,6 +764,7 @@ function loadPlanningDirect_(ids, iso, formatted) {
     hits.forEach(r => {
       const row = rows[r];
       if (!row) return;
+      if (rd(row, 'AA') === '') return; // QUERY ... WHERE Col2 IS NOT NULL
       const out = [++n];
       for (let c = 1; c < map.length; c++) {
         const v = rd(row, map[c]);
@@ -754,20 +784,20 @@ function loadPlanningDirect_(ids, iso, formatted) {
 }
 
 /**
- * Run from the editor. For the project below, loads the Planning, Manpower Cost and WBS Sheet tabs from
+ * Run from the editor. For the project below, loads the the stacked tabs (Planning, Manpower Cost, WBS, INVENTORY, Billing, Auditor Manpower/Item, MOM) from
  * the common sheet AND from the source spreadsheets and reports whether they agree (row counts,
  * identical rows, differing rows), so a tab is only switched to direct reads (remove it from
  * LOCAL_TABS) once it matches.
  */
-function compareSources() {
+function compareSources(only, iso) {
   const projectName = 'Hyatt regency';
-  const ctx = projectContext_(projectName);
+  const ctx = iso ? contextFromIso_(iso) : projectContext_(projectName);
   const norm = c => {
     if (typeof c === 'number') return (c > 20000 && c < 80000) ? String(Math.floor(c)) : String(Math.round(c * 1e6) / 1e6);
     return String(c).trim();
   };
-  [['PROJECT PLANNING', 1], ['Manpower Cost', 0], ['WBS Sheet', 0], ['INVENTORY', 0]].forEach(pair => {
-    const name = pair[0], skipCols = pair[1];
+  [['PROJECT PLANNING', 1, 20], ['Manpower Cost', 0, 3], ['WBS Sheet', 0, 13], ['INVENTORY', 0, 24], ['Billing', 0, 15], ['Auditor Sheet Manpower', 0, 10], ['Auditor Sheet Item', 0, 11], ['MOM', 0, 45]].filter(p => !only || p[0] === only).forEach(pair => {
+    const name = pair[0], skipCols = pair[1], width = pair[2];
     let loc, dir;
     const t1 = Date.now();
     try { loc = loadSources_([name], ctx.ss, null, { iso: ctx.isoNo, source: 'local' })[name]; }
@@ -777,7 +807,7 @@ function compareSources() {
     catch (e) { Logger.log(name + ': direct read FAILED: ' + e.message); return; }
     const t3 = Date.now();
     const hl = headerCount_(name, 'local'), hd = headerCount_(name, 'direct');
-    const sig = (rows) => rows.map(r => r.slice(skipCols, r.length - META_COLS).map(norm).join('|'));
+    const sig = (rows) => rows.map(r => r.slice(skipCols, width).map(norm).join('|'));
     const a = sig(loc.slice(hl)), b = sig(dir.slice(hd));
     const count = {};
     b.forEach(x => { count[x] = (count[x] || 0) + 1; });
@@ -792,6 +822,65 @@ function compareSources() {
     onlyDirect.slice(0, 3).forEach(x => Logger.log('   only in direct: ' + x.slice(0, 200)));
     Logger.log('   RESULT: ' + (a.length === b.length && same === a.length ? 'MATCH - safe to switch' : 'DIFFERENT - do not switch yet'));
   });
+}
+
+// One tab per run, so no single run gets near the 6-minute limit.
+function comparePlanning() { compareSources('PROJECT PLANNING'); }
+function compareManpower() { compareSources('Manpower Cost'); }
+function compareWbs() { compareSources('WBS Sheet'); }
+function compareInventory() { compareSources('INVENTORY'); }
+function compareBilling() { compareSources('Billing'); }
+function compareAuditManpower() { compareSources('Auditor Sheet Manpower'); }
+function compareAuditItem() { compareSources('Auditor Sheet Item'); }
+function compareMom() { compareSources('MOM'); }
+// An ISO that has MOM rows (the Hyatt one has none), so the MOM check is not just 0 = 0.
+function compareMomWithData() { compareSources('MOM', 'MWEPL/2024-25/01143'); }
+
+/**
+ * READ-ONLY and fast: reads only FORMULAS (not values) of the first 60 rows x 104 columns of every
+ * tab of one project spreadsheet (default: the first, STP CIVIL) and ranks the tabs by what makes a
+ * spreadsheet slow to read: volatile functions (TODAY/NOW/RAND/INDIRECT/OFFSET), imports from other
+ * spreadsheets, whole-column ranges like AA:AA, and the number of formula cells. Row/column counts
+ * come from metadata. Stops after 4 minutes. Change the index to scan another spreadsheet.
+ */
+function scanHeavySpreadsheet() {
+  const id = PROJECT_SPREADSHEET_IDS[0];
+  const t0 = Date.now();
+  const meta = Sheets.Spreadsheets.get(id, { fields: 'properties.title,sheets.properties(title,gridProperties(rowCount,columnCount))' });
+  Logger.log('Scanning "' + meta.properties.title + '" (' + meta.sheets.length + ' tabs)');
+  const rows = [];
+  meta.sheets.forEach(sh => {
+    if (Date.now() - t0 > 240000) return;
+    const title = sh.properties.title, gp = sh.properties.gridProperties;
+    const cols = Math.min(gp.columnCount, 104);
+    const range = "'" + title + "'!A1:" + numToCol_(cols) + Math.min(gp.rowCount, 60);
+    let f = [];
+    const t = Date.now();
+    try {
+      f = Sheets.Spreadsheets.Values.get(id, range, { valueRenderOption: 'FORMULA' }).values || [];
+    } catch (e) {
+      Logger.log(title + ': formula read FAILED after ' + (Date.now() - t) + ' ms: ' + e.message);
+      return;
+    }
+    let formulas = 0, volatile = 0, imports = 0, wholeCol = 0, arrays = 0, sample = '';
+    f.forEach(r => r.forEach(c => {
+      const x = String(c);
+      if (x.charAt(0) !== '=') return;
+      formulas++;
+      const v = (x.match(/\b(TODAY|NOW|RAND|RANDBETWEEN|INDIRECT|OFFSET)\s*\(/gi) || []).length;
+      const im = (x.match(/\b(IMPORTRANGE|IMPORTDATA|IMPORTHTML|IMPORTXML|IMPORTFEED|GOOGLEFINANCE)\s*\(/gi) || []).length;
+      volatile += v; imports += im;
+      wholeCol += (x.match(/\$?[A-Z]{1,3}:\$?[A-Z]{1,3}(?![0-9A-Za-z])/g) || []).length;
+      arrays += (x.match(/\b(ARRAYFORMULA|QUERY|FILTER|VLOOKUP|XLOOKUP|SORT|UNIQUE)\s*\(/gi) || []).length;
+      if (!sample && (v || im)) sample = x.replace(/\s+/g, ' ').slice(0, 110);
+    }));
+    rows.push({ title: title, size: gp.rowCount + 'x' + gp.columnCount, formulas: formulas, volatile: volatile, imports: imports, wholeCol: wholeCol, arrays: arrays, sample: sample,
+      score: volatile * 20 + imports * 10 + wholeCol * 2 + arrays + formulas / 10 + gp.rowCount * gp.columnCount / 100000 });
+  });
+  rows.sort((a, b) => b.score - a.score).forEach(r => Logger.log(
+    r.title + ' (' + r.size + '): formula cells ' + r.formulas + ' | volatile ' + r.volatile + ' | imports ' + r.imports +
+    ' | whole-column refs ' + r.wholeCol + ' | array/lookup fns ' + r.arrays + (r.sample ? ' | e.g. ' + r.sample : '')));
+  Logger.log('scan finished in ' + (Date.now() - t0) + ' ms (only the first 60 rows of each tab are scanned)');
 }
 
 /**
